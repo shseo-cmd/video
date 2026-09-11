@@ -153,6 +153,8 @@
   /* ---------- waveform ---------- */
   .wavewrap { position: relative; }
   canvas { display: block; width: 100%; }
+  /* the waveforms are scrubbable, so say so with the cursor */
+  #wave, #result { cursor: pointer; touch-action: none; }
   #wave { height: 172px; }
   #result { height: 46px; }
   .strip-label {
@@ -268,8 +270,9 @@
           <button id="playSrc">원본 재생</button>
           <button id="playRes">결과 재생</button>
           <button id="stop" disabled>정지</button>
-          <span class="clock mono" id="clock">00:00:00:00</span>
+          <span class="clock mono" id="clock">00:00:00:00 / 00:00:00:00</span>
         </div>
+        <div class="strip-label"><span>파형을 클릭하거나 드래그해 원하는 지점부터 재생</span></div>
       </section>
 
       <section class="panel">
@@ -434,6 +437,7 @@
     env: null, hop: 0.01, peaks: null,
     sil: [], cuts: [], keeps: [],
     src: null, playing: null, raf: 0, startedAt: 0, playDur: 0,
+    offset: 0, head: { src: 0, res: 0 }, scrub: null,
     trimmed: null, trimmedKey: ""
   };
   var P = { pad: 0.1, thresh: -35, minsil: 0.12, fps: 30, w: 1080, h: 1350 };
@@ -675,11 +679,16 @@
       pos += len;
     }
     $("rows").innerHTML = html;
-    drawWave(null); drawResult(null);
+    // redraw the waveforms AND refresh the position/duration readout: the
+    // result length changes whenever the detection settings do
+    paintHeads();
   }
 
   function recompute() {
-    segment(); paint();
+    segment();
+    // the result timeline just changed length — keep the playhead inside it
+    clampHeads();
+    paint();
   }
 
   /* ============ trimmed buffer ============ */
@@ -712,38 +721,113 @@
   }
 
   /* ============ playback ============ */
-  function stop() {
-    if (S.src) { try { S.src.stop(); } catch (e) {} S.src.disconnect(); S.src = null; }
+  function viewDur(which) {
+    return which === "src" ? (S.buffer ? S.buffer.duration : 0) : resultDur();
+  }
+
+  // the playhead each view will start from; kept inside the view's length, which
+  // shrinks as the detection settings change
+  function clampHeads() {
+    S.head.src = Math.max(0, Math.min(S.head.src, viewDur("src")));
+    S.head.res = Math.max(0, Math.min(S.head.res, viewDur("res")));
+  }
+
+  // playback may have started from a seek offset, so count from there
+  function livePos() {
+    if (!S.playing) return 0;
+    var t = S.offset + (ctx.currentTime - S.startedAt);
+    return Math.max(0, Math.min(t, S.playDur));
+  }
+
+  function headOf(which) {
+    return S.playing === which ? livePos() : S.head[which];
+  }
+
+  function paintHeads() {
+    drawWave(headOf("src"));
+    drawResult(headOf("res"));
+    var which = S.playing || "res";
+    $("clock").textContent = tc(headOf(which), P.fps) + " / " + tc(viewDur(which), P.fps);
+  }
+
+  function stop(resetHead) {
+    if (S.src) {
+      S.src.onended = null;
+      try { S.src.stop(); } catch (e) {}
+      S.src.disconnect(); S.src = null;
+    }
     if (S.raf) cancelAnimationFrame(S.raf);
-    S.raf = 0; S.playing = null;
+    S.raf = 0;
+    // leave the playhead where it stopped so the next press resumes from there
+    if (S.playing) S.head[S.playing] = resetHead ? 0 : livePos();
+    S.playing = null;
     $("stop").disabled = true;
     $("playSrc").textContent = "원본 재생";
     $("playRes").textContent = "결과 재생";
-    drawWave(null); drawResult(null);
-    $("clock").textContent = tc(0, P.fps);
+    paintHeads();
   }
 
-  function play(which) {
+  function play(which, from) {
     stop();
-    if (ctx.state === "suspended") ctx.resume();
+    if (ctx.state === "suspended") { try { ctx.resume(); } catch (e) {} }
     var buf = which === "src" ? S.buffer : buildTrimmed();
+    if (!buf || !buf.duration) return;
+    var at = from == null ? S.head[which] : from;
+    // starting within a hair of the end would play nothing — go back to the top
+    if (at >= buf.duration - 0.02) at = 0;
+    at = Math.max(0, at);
+
     var node = ctx.createBufferSource();
-    node.buffer = buf; node.connect(ctx.destination);
-    node.onended = function () { if (S.playing === which) stop(); };
-    node.start();
-    S.src = node; S.playing = which; S.startedAt = ctx.currentTime; S.playDur = buf.duration;
+    node.buffer = buf;
+    node.connect(ctx.destination);
+    node.onended = function () { if (S.playing === which) stop(true); };
+    node.start(0, at);
+
+    S.src = node; S.playing = which; S.offset = at;
+    S.startedAt = ctx.currentTime; S.playDur = buf.duration;
+    S.head[which] = at;
     $("stop").disabled = false;
     $(which === "src" ? "playSrc" : "playRes").textContent = "재생 중";
     tick();
   }
 
   function tick() {
-    var t = ctx.currentTime - S.startedAt;
-    if (t > S.playDur) t = S.playDur;
-    $("clock").textContent = tc(t, P.fps);
-    if (S.playing === "src") { drawWave(t); drawResult(null); }
-    else { drawResult(t); drawWave(null); }
+    paintHeads();
     S.raf = requestAnimationFrame(tick);
+  }
+
+  /* ---------- scrubbing: click or drag a waveform to play from there ---------- */
+  function seekFromEvent(which, cv, e) {
+    var r = cv.getBoundingClientRect();
+    if (!r.width) return 0;
+    var x = Math.max(0, Math.min(e.clientX - r.left, r.width));
+    return (x / r.width) * viewDur(which);
+  }
+
+  function bindScrub(id, which) {
+    var cv = $(id);
+    cv.addEventListener("pointerdown", function (e) {
+      if (!S.buffer) return;
+      e.preventDefault();
+      if (S.playing) stop();
+      S.scrub = { which: which };
+      S.head[which] = seekFromEvent(which, cv, e);
+      try { cv.setPointerCapture(e.pointerId); } catch (err) {}
+      paintHeads();
+    });
+    cv.addEventListener("pointermove", function (e) {
+      if (!S.scrub || S.scrub.which !== which) return;
+      S.head[which] = seekFromEvent(which, cv, e);
+      paintHeads();
+    });
+    function release(e) {
+      if (!S.scrub || S.scrub.which !== which) return;
+      S.scrub = null;
+      try { cv.releasePointerCapture(e.pointerId); } catch (err) {}
+      play(which, S.head[which]);
+    }
+    cv.addEventListener("pointerup", release);
+    cv.addEventListener("pointercancel", release);
   }
 
   /* ============ encoders ============ */
@@ -1615,6 +1699,7 @@
   function loadBuffer(buf, name, demo, rawBytes) {
     stop();
     S.buffer = buf; S.name = name; S.isDemo = !!demo; S.rawBytes = rawBytes || null;
+    S.head.src = 0; S.head.res = 0;
     $("fname").textContent = name;
     $("fchip").hidden = !demo;
     $("fchip").textContent = "예시";
@@ -1763,10 +1848,12 @@
 
   $("playSrc").addEventListener("click", function () { S.playing === "src" ? stop() : play("src"); });
   $("playRes").addEventListener("click", function () { S.playing === "res" ? stop() : play("res"); });
-  $("stop").addEventListener("click", stop);
+  $("stop").addEventListener("click", function () { stop(); });
+  bindScrub("wave", "src");
+  bindScrub("result", "res");
   $("export").addEventListener("click", doExport);
 
-  window.addEventListener("resize", function () { drawWave(null); drawResult(null); });
+  window.addEventListener("resize", function () { drawWave(headOf("src")); drawResult(headOf("res")); });
 
   // decorative level meter
   (function () {
