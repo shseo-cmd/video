@@ -943,7 +943,7 @@
     '      self.postMessage({ type: "ready" });',
     '    } else if (m.type === "run") {',
     '      var r = await pipe(m.audio, m.opts);',
-    '      self.postMessage({ type: "text", id: m.id, text: (r && r.text) || "" });',
+    '      self.postMessage({ type: "text", id: m.id, text: (r && r.text) || "", chunks: (r && r.chunks) || null });',
     '    }',
     '  } catch (err) {',
     '    self.postMessage({ type: "error", id: m.id, message: String((err && err.message) || err) });',
@@ -972,7 +972,7 @@
     '      self.postMessage({ type: "ready" });',
     '    } else if (m.type === "run") {',
     '      const r = await pipe(m.audio, m.opts);',
-    '      self.postMessage({ type: "text", id: m.id, text: (r && r.text) || "" });',
+    '      self.postMessage({ type: "text", id: m.id, text: (r && r.text) || "", chunks: (r && r.chunks) || null });',
     '    }',
     '  } catch (err) {',
     '    self.postMessage({ type: "error", id: m.id, message: String((err && err.message) || err) });',
@@ -1072,19 +1072,20 @@
     });
   }
 
-  function runSegWorker(audio, opts) {
+  // resolves { text, chunks } — chunks carry per-word timings when asked for
+  function runSegWorker(audio, opts, timeoutMs) {
     return new Promise(function (resolve, reject) {
       var id = ++asr.seq, done = false;
       var t = setTimeout(function () {
         if (done) return;
         done = true; delete asr.pending[id];
         reject(new Error("segment-timeout"));
-      }, SEG_TIMEOUT_MS);
+      }, timeoutMs || SEG_TIMEOUT_MS);
       asr.pending[id] = function (m) {
         if (done) return;
         done = true; clearTimeout(t);
         if (m.type === "error") reject(new Error(m.message || "asr"));
-        else resolve(m.text);
+        else resolve({ text: m.text || "", chunks: m.chunks || null });
       };
       // audio is a fresh Float32Array per segment — hand off its buffer, no copy
       asr.worker.postMessage({ type: "run", id: id, audio: audio, opts: opts }, [audio.buffer]);
@@ -1103,7 +1104,12 @@
   }
 
   function extractSegmentMono16k(a, b) {
-    var buf = S.buffer, sr = buf.sampleRate, ch = buf.numberOfChannels;
+    return toMono16k(S.buffer, a, b);
+  }
+
+  // Whisper wants mono 16 kHz; downmix and resample whatever we hand it
+  function toMono16k(buf, a, b) {
+    var sr = buf.sampleRate, ch = buf.numberOfChannels;
     var i0 = Math.max(0, Math.round(a * sr)), i1 = Math.min(buf.length, Math.round(b * sr));
     var n = Math.max(0, i1 - i0), i, c;
     var mono = new Float32Array(n);
@@ -1123,7 +1129,9 @@
     return out;
   }
 
-  var MAX_ASR_SEGMENTS = 400;
+  // recognition now runs once over the whole timeline, so the cost scales with
+  // duration, not with how many clips the silence detector produced
+  var MAX_ASR_SECONDS = 1800;
 
   function asrProgressReporter(onStatus) {
     return function (p) {
@@ -1142,8 +1150,8 @@
     // so this can only ever fail — say why instead of trying and stalling
     if (location.protocol === "file:") throw new Error("file-protocol");
     var segs = timelineSegments();
-    if (segs.length > MAX_ASR_SEGMENTS) {
-      throw new Error("too-many-segments:" + segs.length);
+    if (resultDur() > MAX_ASR_SECONDS) {
+      throw new Error("too-long:" + Math.round(resultDur()));
     }
     var model = ($("model") && $("model").value) || "Xenova/whisper-tiny";
     var report = asrProgressReporter(onStatus);
@@ -1166,20 +1174,233 @@
     }
 
     var lang = $("lang").value || undefined;
-    var texts = [];
-    for (var i = 0; i < segs.length; i++) {
-      if (asr.cancelled) throw new Error("cancelled");
-      onStatus("음성 인식 중 " + (i + 1) + "/" + segs.length + "… (중단 가능)");
-      var audio = extractSegmentMono16k(segs[i].srcA, segs[i].srcB);
-      var opts = { task: "transcribe" };
-      if (lang) opts.language = lang;
-      var text = "";
-      if (audio.length) text = await runSegWorker(audio, opts);
-      texts.push(String(text).trim());
-      // let the browser repaint between segments
-      await new Promise(function (r) { setTimeout(r, 0); });
+
+    // ---- ONE pass over the trimmed timeline, not one call per clip ----------
+    // The trimmed buffer IS the timeline, so word timings come back already in
+    // timeline seconds — nothing to map. Transcribing the whole thing at once
+    // also lets Whisper see complete sentences, which is what makes its
+    // punctuation usable; per-clip calls fed it half-sentences.
+    var trimmed = buildTrimmed();
+    var audio = toMono16k(trimmed, 0, trimmed.duration);
+    var dur = trimmed.duration;
+    // long jobs need a longer leash, but still a finite one
+    var budget = Math.min(1800000, Math.max(180000, Math.round(dur * 15000)));
+
+    var tick = startElapsed(onStatus, dur);
+    var words = null, plain = "";
+    try {
+      // chunk_length_s is required: without it Whisper silently truncates
+      // anything past its 30-second window.
+      var base = { task: "transcribe", chunk_length_s: 30, stride_length_s: 5 };
+      if (lang) base.language = lang;
+
+      var res = null;
+      try {
+        res = await runSegWorker(audio, mix(base, { return_timestamps: "word" }), budget);
+        words = normaliseWords(res.chunks);
+      } catch (wordErr) {
+        if ((wordErr && wordErr.message) === "cancelled") throw wordErr;
+        words = null;
+      }
+      if (!words || !words.length) {
+        // some builds refuse word-level alignment — coarser timings still beat
+        // clip-boundary timings, so try phrase level, then plain text
+        if (asr.cancelled) throw new Error("cancelled");
+        if (!res) res = await runSegWorker(audio, mix(base, { return_timestamps: true }), budget);
+        words = normaliseWords(res.chunks);
+        plain = res.text || "";
+      } else {
+        plain = res.text || "";
+      }
+    } finally {
+      tick.stop();
     }
-    return { segs: segs, texts: texts };
+    if (asr.cancelled) throw new Error("cancelled");
+
+    var cues = words && words.length
+      ? buildCues(words, dur)
+      : spreadPlainText(plain, segs);          // last resort: no timings at all
+    if (!cues.length) throw new Error("no-speech");
+    return { cues: cues, dur: dur };
+  }
+
+  function mix(a, b) {
+    var o = {}, k;
+    for (k in a) if (Object.prototype.hasOwnProperty.call(a, k)) o[k] = a[k];
+    for (k in b) if (Object.prototype.hasOwnProperty.call(b, k)) o[k] = b[k];
+    return o;
+  }
+
+  // inference gives no progress events, so show elapsed time — otherwise a long
+  // job is indistinguishable from a hung one
+  function startElapsed(onStatus, dur) {
+    var t0 = Date.now();
+    function paintStatus() {
+      var s = Math.round((Date.now() - t0) / 1000);
+      onStatus("음성 인식 중… " + s + "초 경과 (오디오 " + dur.toFixed(0) + "초 · 중단 가능)");
+    }
+    paintStatus();
+    var iv = setInterval(paintStatus, 1000);
+    return { stop: function () { clearInterval(iv); } };
+  }
+
+  // Whisper hands back [{ text, timestamp: [start, end] }, …]; drop anything
+  // without usable timings rather than trusting a null
+  function normaliseWords(chunks) {
+    if (!chunks || !chunks.length) return null;
+    var out = [];
+    for (var i = 0; i < chunks.length; i++) {
+      var c = chunks[i], t = c && c.timestamp;
+      var txt = String((c && c.text) || "").trim();
+      if (!txt || !t || t[0] == null) continue;
+      var a = Number(t[0]), b = t[1] == null ? a : Number(t[1]);
+      if (!isFinite(a) || !isFinite(b)) continue;
+      out.push({ text: txt, a: a, b: Math.max(b, a) });
+    }
+    return out.length ? out : null;
+  }
+
+  /* ---------- caption shaping rules (tuned for Korean, 9:16) ---------- */
+  var CC = {
+    charsPerLine: 14,   // a comfortable line on a vertical phone frame
+    maxLines: 2,
+    maxCps: 9,          // chars per second before a cue is too dense to read
+    minDur: 1.0,
+    maxDur: 6.0,
+    gap: 0.08,          // hold-off between cues so they don't flicker
+    pause: 0.5          // a silence this long ends a caption even mid-sentence
+  };
+  function maxCharsPerCue() { return CC.charsPerLine * CC.maxLines; }
+
+  function isSentenceEnd(w) { return /[.!?…。！？]["')\]]?$/.test(w); }
+  function isClauseEnd(w) { return /[,·;:、，]["')\]]?$/.test(w); }
+
+  // group words -> sentences -> cues that satisfy the reading rules
+  function buildCues(words, totalDur) {
+    var groups = [], cur = [];
+    for (var i = 0; i < words.length; i++) {
+      cur.push(words[i]);
+      var nextGap = i + 1 < words.length ? words[i + 1].a - words[i].b : 0;
+      if (isSentenceEnd(words[i].text) || nextGap >= CC.pause || i === words.length - 1) {
+        if (cur.length) groups.push(cur);
+        cur = [];
+      }
+    }
+
+    var cues = [];
+    for (i = 0; i < groups.length; i++) splitGroup(groups[i], cues, i);
+
+    // Merge anything too brief to read back into its neighbour — but ONLY within
+    // the same sentence. Merging across a sentence boundary produces a caption
+    // holding the tail of one sentence and the head of the next, which reads
+    // worse than the short cue it was meant to fix.
+    for (i = 0; i < cues.length - 1; i++) {
+      var a = cues[i], b = cues[i + 1];
+      if (a.g !== b.g) continue;
+      var joined = a.text.length + 1 + b.text.length;
+      var tooShort = (a.b - a.a) < CC.minDur || (b.b - b.a) < CC.minDur;
+      if (tooShort && joined <= maxCharsPerCue() && (b.b - a.a) <= CC.maxDur) {
+        a.text += " " + b.text; a.b = b.b;
+        cues.splice(i + 1, 1); i--;
+      }
+    }
+
+    // a short final cue can borrow time from the silence that follows it
+    for (i = 0; i < cues.length; i++) {
+      var c = cues[i];
+      if (c.b - c.a < CC.minDur) {
+        var ceiling = i + 1 < cues.length ? cues[i + 1].a - CC.gap : totalDur;
+        c.b = Math.min(ceiling, c.a + CC.minDur);
+      }
+      if (i + 1 < cues.length && cues[i + 1].a - c.b < CC.gap) {
+        c.b = Math.max(c.a, cues[i + 1].a - CC.gap);
+      }
+      c.b = Math.min(c.b, totalDur);
+      c.a = Math.max(0, c.a);
+    }
+
+    for (i = 0; i < cues.length; i++) cues[i].lines = wrapKo(cues[i].text);
+    return cues.filter(function (c) { return c.b > c.a && c.text; });
+  }
+
+  // recursively cut a word run down until every piece is readable
+  function splitGroup(ws, out, g) {
+    var text = ws.map(function (w) { return w.text; }).join(" ").replace(/\s+/g, " ").trim();
+    var a = ws[0].a, b = ws[ws.length - 1].b, dur = Math.max(0.01, b - a);
+    var tooLong = text.length > maxCharsPerCue();
+    var tooSlow = dur > CC.maxDur;
+    // Reading rate only justifies a split once there is a real amount of text.
+    // Splitting a short natural sentence does not slow the speaker down — it
+    // just fragments a line that was already readable.
+    var tooDense = text.length > maxCharsPerCue() * 0.75 && (text.length / dur) > CC.maxCps;
+
+    if (ws.length > 1 && (tooLong || tooSlow || tooDense)) {
+      var at = pickBreak(ws);
+      if (at > 0 && at < ws.length) {
+        splitGroup(ws.slice(0, at), out, g);
+        splitGroup(ws.slice(at), out, g);
+        return;
+      }
+    }
+    out.push({ a: a, b: b, text: text, g: g });
+  }
+
+  // prefer a clause boundary, then the widest pause, then the midpoint
+  function pickBreak(ws) {
+    var mid = ws.length / 2, best = -1, bestScore = -Infinity;
+    for (var i = 0; i < ws.length - 1; i++) {
+      var score = -Math.abs((i + 1) - mid) * 0.6;
+      if (isClauseEnd(ws[i].text)) score += 6;
+      score += Math.min(3, (ws[i + 1].a - ws[i].b) * 6);
+      if (score > bestScore) { bestScore = score; best = i + 1; }
+    }
+    return best < 1 ? Math.max(1, Math.round(mid)) : best;
+  }
+
+  // break into at most two lines on 어절 (word) boundaries, kept balanced —
+  // Korean gets much harder to read when a word is split across lines
+  function wrapKo(text) {
+    if (text.length <= CC.charsPerLine) return [text];
+    var w = text.split(" ");
+    if (w.length === 1) return [text];
+    var bestAt = 1, bestDiff = Infinity;
+    for (var i = 1; i < w.length; i++) {
+      var l1 = w.slice(0, i).join(" ").length, l2 = w.slice(i).join(" ").length;
+      var diff = Math.abs(l1 - l2) + (Math.max(l1, l2) > CC.charsPerLine ? 100 : 0);
+      if (diff < bestDiff) { bestDiff = diff; bestAt = i; }
+    }
+    return [w.slice(0, bestAt).join(" "), w.slice(bestAt).join(" ")];
+  }
+
+  // no timings came back at all: fall back to clip boundaries, splitting the
+  // text across clips in proportion to their length
+  function spreadPlainText(text, segs) {
+    var t = String(text || "").trim();
+    if (!t || !segs.length) return [];
+    // split after sentence punctuation WITHOUT a lookbehind — an unsupported
+    // lookbehind fails when the script is parsed, taking the whole page with it
+    var sentences = (t.match(/[^.!?…]+[.!?…]*/g) || [t])
+      .map(function (s) { return s.trim(); }).filter(Boolean);
+    if (sentences.length <= 1) sentences = [t];
+    var cues = [], per = Math.ceil(sentences.length / segs.length), k = 0;
+    for (var i = 0; i < segs.length && k < sentences.length; i++) {
+      var piece = sentences.slice(k, k + per).join(" ").trim();
+      k += per;
+      if (piece) cues.push({ a: segs[i].tlA, b: segs[i].tlB, text: piece, lines: wrapKo(piece) });
+    }
+    return cues;
+  }
+
+  // QC numbers worth telling the person about
+  function cueStats(cues) {
+    var dense = 0, longest = 0, chars = 0;
+    for (var i = 0; i < cues.length; i++) {
+      var c = cues[i], d = Math.max(0.01, c.b - c.a);
+      if (c.text.length / d > CC.maxCps) dense++;
+      longest = Math.max(longest, c.text.length);
+      chars += c.text.length;
+    }
+    return { n: cues.length, dense: dense, longest: longest, chars: chars };
   }
 
   function srtStamp(t) {
@@ -1192,11 +1413,12 @@
     return p2(h) + ":" + p2(m) + ":" + p2(s) + "," + p3(ms);
   }
 
-  function buildSrt(segs, texts) {
+  function buildSrt(cues) {
     var out = "";
-    for (var i = 0; i < segs.length; i++) {
-      var text = texts[i] || "(인식 결과 없음)";
-      out += (i + 1) + "\n" + srtStamp(segs[i].tlA) + " --> " + srtStamp(segs[i].tlB) + "\n" + text + "\n\n";
+    for (var i = 0; i < cues.length; i++) {
+      var c = cues[i];
+      var body = (c.lines && c.lines.length ? c.lines : [c.text]).join("\n");
+      out += (i + 1) + "\n" + srtStamp(c.a) + " --> " + srtStamp(c.b) + "\n" + body + "\n\n";
     }
     return out;
   }
@@ -1224,7 +1446,8 @@
     if (m === "model-stalled") return "인식 모델을 내려받지 못했습니다 (네트워크·사내 방화벽이 cdn.jsdelivr.net 을 막고 있을 수 있습니다)";
     if (m === "segment-timeout") return "이 컴퓨터에서 음성 인식이 너무 오래 걸립니다 (모델을 tiny로 낮춰 보세요)";
     if (m.indexOf("worker-unavailable") === 0) return "이 브라우저에서 백그라운드 음성 인식을 실행할 수 없습니다 — 화면을 멈추게 하지 않으려고 자막만 건너뛰었습니다 (크롬·엣지 최신 버전 권장)";
-    if (m.indexOf("too-many-segments:") === 0) return "컷 구간이 " + m.split(":")[1] + "개로 너무 많습니다 (자막은 구간당 한 번씩 인식하므로 " + MAX_ASR_SEGMENTS + "개까지만 지원합니다)";
+    if (m.indexOf("too-long:") === 0) return "결과 길이가 " + Math.round(m.split(":")[1] / 60) + "분으로 너무 깁니다 (자막은 " + (MAX_ASR_SECONDS / 60) + "분까지만 지원합니다)";
+    if (m === "no-speech") return "인식된 음성이 없습니다 (무음이거나 목소리가 너무 작을 수 있습니다)";
     if (m === "file-protocol") return "HTML 파일을 직접 열면(file://) 인식 모델을 불러올 수 없습니다 — 웹서버로 올려서 열어 주세요";
     return "브라우저가 음성 인식을 실행하지 못했습니다 (" + (m || "원인 불명") + ")";
   }
@@ -1232,7 +1455,7 @@
   async function doExport() {
     var btn = $("export");
     var wantCC = $("cc").checked;
-    var ccFailed = null;
+    var ccFailed = null, ccStats = null;
     btn.disabled = true;
     statusPinned = true;
     setStatus("파일을 만드는 중…");
@@ -1263,8 +1486,10 @@
         $("cancel").hidden = false;
         try {
           var tr = await transcribeAll(function (msg, kind) { setStatus(msg, kind); });
-          srtText = buildSrt(tr.segs, tr.texts);
-          ccNote = base + "_자막.srt          컷된 타임라인에 맞춘 자막 (음성 인식 결과이므로 오탈자 확인 필요)";
+          srtText = buildSrt(tr.cues);
+          ccStats = cueStats(tr.cues);
+          ccNote = base + "_자막.srt          컷된 타임라인에 맞춘 자막 " +
+            "(" + ccStats.n + "개 · 음성 인식 결과이므로 오탈자 확인 필요)";
           setStatus("파일을 만드는 중…");
         } catch (ccErr) {
           // captions are optional — never let them take the audio/XML down with them
@@ -1335,7 +1560,18 @@
           "2. 프로젝트 패널에 생긴 캡션 클립을 시퀀스 위 트랙으로 끌어다 놓습니다.\n" +
           "   자막 시간이 컷된 타임라인 기준으로 이미 맞춰져 있어 그대로 얹으면 됩니다.\n" +
           "3. 자막은 오픈소스 음성 인식(Whisper) 결과라 사람이 한 번 검수하는 걸 권장합니다.\n" +
-          "   인식 모델: " + (($("model") && $("model").value) || "-") + "\n"
+          "   인식 모델: " + (($("model") && $("model").value) || "-") + "\n" +
+          "\n자막 구성 방식\n" +
+          "------------------------------------------\n" +
+          "자막 " + ccStats.n + "개 · 가장 긴 자막 " + ccStats.longest + "자\n" +
+          "문장 끝(. ? !)과 " + CC.pause.toFixed(1) + "초 이상의 무음을 기준으로 끊고,\n" +
+          "한 줄 최대 " + CC.charsPerLine + "자 · 최대 " + CC.maxLines + "줄 · " +
+          CC.minDur.toFixed(1) + "~" + CC.maxDur.toFixed(1) + "초로 맞췄습니다.\n" +
+          "줄바꿈은 어절 경계에서만 하므로 단어가 잘리지 않습니다.\n" +
+          (ccStats.dense
+            ? "참고: " + ccStats.dense + "개 자막은 초당 " + CC.maxCps +
+              "자를 넘어 다소 빠릅니다 (말이 빠른 구간). 필요하면 프리미어에서 나눠 주세요.\n"
+            : "모든 자막이 읽기 속도 기준(초당 " + CC.maxCps + "자) 안에 들어옵니다.\n")
           : "")
       );
       files.push({ name: "읽어보세요.txt", data: readme });
