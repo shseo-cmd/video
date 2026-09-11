@@ -516,9 +516,20 @@
     }
     if (start >= 0 && (env.length - start) * hop >= P.minsil) sil.push([start * hop, dur]);
 
-    var cuts = [], pad = P.pad;
+    // Every edit point is decided ON THE FRAME GRID, because that is the only
+    // grid Premiere can place an edit on. If the cuts were chosen at exact sample
+    // positions instead, Premiere would round each one to the nearest frame on
+    // import — up to half a frame away (16.5 ms at 30fps, 735 samples at 44.1kHz)
+    // from what was auditioned here — which clips the first syllable of a phrase
+    // and leaves stray gaps elsewhere. Snapping here instead means the waveform
+    // preview, the exported WAV and the Premiere timeline describe one identical
+    // edit. The snap goes INWARD (remove slightly less silence), so a rounding
+    // error can only ever leave a few extra milliseconds of room — never eat speech.
+    var fps = P.fps, cuts = [], pad = P.pad;
+    var lastFrame = Math.floor(dur * fps), endT = lastFrame / fps;
     for (i = 0; i < sil.length; i++) {
-      var a = sil[i][0] + pad, b = sil[i][1] - pad;
+      var a = Math.ceil((sil[i][0] + pad) * fps) / fps;
+      var b = Math.floor((sil[i][1] - pad) * fps) / fps;
       if (b - a > 0.02) cuts.push([a, b]);
     }
     var keeps = [], pos = 0;
@@ -526,7 +537,8 @@
       if (cuts[i][0] > pos) keeps.push([pos, cuts[i][0]]);
       pos = cuts[i][1];
     }
-    if (pos < dur) keeps.push([pos, dur]);
+    // the tail ends on a whole frame that still exists in the media
+    if (endT - pos > 0.001) keeps.push([pos, endT]);
 
     S.sil = sil; S.cuts = cuts; S.keeps = keeps;
     S.trimmed = null;
@@ -672,7 +684,9 @@
 
   /* ============ trimmed buffer ============ */
   function buildTrimmed() {
-    var key = S.keeps.length + ":" + P.pad + ":" + P.thresh + ":" + P.minsil;
+    // fps is part of the key: the cut points are snapped to the frame grid, so a
+    // different frame rate is a different edit and the cached buffer is stale
+    var key = S.keeps.length + ":" + P.pad + ":" + P.thresh + ":" + P.minsil + ":" + P.fps;
     if (S.trimmed && S.trimmedKey === key) return S.trimmed;
     var buf = S.buffer, sr = buf.sampleRate, ch = buf.numberOfChannels;
     var total = 0, i, c;
@@ -1306,8 +1320,14 @@
         "혹시 미디어 찾기 창이 뜬다면 같은 폴더의 " + mediaName + " 를 지정해 주세요.\n" +
         "XML은 원본을 재인코딩하지 않고 참조만 하므로 음질 손실이 없고, 각 컷 지점이\n" +
         "개별 클립으로 남아 있어 프리미어에서 다시 다듬을 수 있습니다.\n" +
-        "시퀀스 프레임레이트를 프로젝트와 다르게 두면 편집 시 프레임 단위로\n" +
-        "반올림되어 미세하게 어긋날 수 있습니다.\n" +
+        "\n컷 지점 정렬\n" +
+        "------------------------------------------\n" +
+        "모든 컷 지점은 " + P.fps + "fps 프레임 경계에 정확히 정렬돼 있습니다. 그래서 이 WAV와\n" +
+        "XML 시퀀스는 완전히 동일한 편집을 나타내고, 프리미어가 임포트할 때 컷을\n" +
+        "다시 반올림하지 않습니다 (말 앞이 잘리거나 공백이 생기지 않음).\n" +
+        "대신 무음이 컷당 한 프레임 미만(" + (1000 / P.fps).toFixed(0) + "ms 이하)만큼 덜 지워집니다.\n" +
+        "중요: 프리미어 시퀀스를 반드시 " + P.fps + "fps로 두세요. 프로젝트 프레임레이트가\n" +
+        "다르면 프리미어가 컷을 자기 그리드로 다시 옮기면서 어긋납니다.\n" +
         (srtText ?
           "\nSRT 자막 사용하기\n" +
           "------------------------------------------\n" +
@@ -1479,7 +1499,13 @@
     $("specTc").textContent = P.fps + "fps 시간 코드";
     paint();
   }
-  $("fps").addEventListener("change", function () { P.fps = parseFloat(this.value); syncSeq(); });
+  // changing the frame rate moves the grid the cuts are snapped to, so the whole
+  // edit has to be recomputed — not just relabelled
+  $("fps").addEventListener("change", function () {
+    P.fps = parseFloat(this.value);
+    recompute();
+    syncSeq();
+  });
   $("preset").addEventListener("change", function () {
     var custom = this.value === "custom";
     $("sizeFields").hidden = !custom;
